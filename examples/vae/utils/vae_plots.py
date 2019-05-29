@@ -1,5 +1,7 @@
 import torch
 
+import matplotlib.pyplot as plt
+
 
 def plot_conditional_samples_ssvae(ssvae, visdom_session):
     """
@@ -22,8 +24,38 @@ def plot_conditional_samples_ssvae(ssvae, visdom_session):
         vis.images(images, 10, 2)
 
 
+def plot_conditional_samples_ssvae_irt(ssvae, visdom_session, diff):
+    """
+    This is a method to do conditional sampling in visdom
+    """
+    #vis = visdom_session
+        
+    ys = {}
+    for i in range(10):
+        ys[i] = torch.zeros(1, 10)
+        ys[i][0, i] = 1
+    xs = torch.zeros(1, 784)
+    diff_tensor = torch.tensor(diff).unsqueeze(-1)  
+
+    for i in range(10):
+        images = []
+        fig, axes = plt.subplots(nrows=10, ncols=10, figsize=(28,28)) 
+        for ax in axes.flatten():
+            ax.axis('off') 
+
+        for j in range(10):
+            for k in range(10):
+                # get the loc from the model
+                sample_loc_i = ssvae.model(xs, ys[i], diff_tensor)
+                img = sample_loc_i[0].view(1, 28, 28).squeeze().cpu().data.numpy()
+                axes[j,k].imshow(img, cmap='gray')
+                #images.append(img)
+        plt.savefig('./vae_results/mnist_by_diff_{}_{}.png'.format(i, diff), bbox_inches='tight') 
+        plt.close(fig) 
+        #vis.images(images, 10, 2)
+
+
 def plot_llk(train_elbo, test_elbo):
-    import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
     import scipy as sp
@@ -71,7 +103,8 @@ def mnist_test_tsne_ssvae(name=None, ssvae=None, test_loader=None):
         name = 'SS-VAE'
     data = test_loader.dataset.test_data.float()
     mnist_labels = test_loader.dataset.test_labels
-    z_loc, z_scale = ssvae.encoder_z([data, mnist_labels])
+    _, diffs, _ = ssvae.encoder_y(data) 
+    z_loc, z_scale = ssvae.encoder_z([data, mnist_labels, diffs])
     plot_tsne(z_loc, mnist_labels, name)
 
 

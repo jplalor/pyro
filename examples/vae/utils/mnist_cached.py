@@ -1,3 +1,4 @@
+import csv 
 import errno
 import os
 from functools import reduce
@@ -139,6 +140,8 @@ class MNISTCached(MNIST):
             return fn_y_mnist(y, use_cuda)
 
         self.mode = mode
+        
+        self.idx = torch.tensor(list(range(len(self.data))), dtype=torch.int)
 
         assert mode in ["sup", "unsup", "test", "valid"], "invalid train/test option values"
 
@@ -185,15 +188,61 @@ class MNISTCached(MNIST):
         :returns tuple: (image, target) where target is index of the target class.
         """
         if self.mode in ["sup", "unsup", "valid"]:
-            img, target = self.data[index], self.targets[index]
+            img, target, idx = self.data[index], self.targets[index], self.idx[index]
         elif self.mode == "test":
-            img, target = self.data[index], self.targets[index]
+            img, target, idx = self.data[index], self.targets[index], self.idx[index]
         else:
             assert False, "invalid mode: {}".format(self.mode)
-        return img, target
+        return img, target, idx 
 
 
-def setup_data_loaders(dataset, use_cuda, batch_size, sup_num=None, root=None, download=True, **kwargs):
+def load_irt_data(file_path, root, download, use_cuda):
+    obs = []
+    models = []
+    items = []
+    responses = []
+
+    model2idx = {}
+    item2idx = {}
+    idx2model = {}
+    idx2item = {}
+    modelcounter = 0
+    itemcounter = 0
+
+    # inputs have to be trainsize, noise, itemID, response
+    with open(file_path, 'r') as infile:
+        inreader = csv.reader(infile, delimiter=',')
+        next(inreader)  # skip headers 
+        for line in inreader:
+            trainsize, noise, itemID, response = line
+            modelID = '{}_{}'.format(trainsize, noise)
+            response = int(response)
+            
+            if modelID not in model2idx:
+                model2idx[modelID] = modelcounter
+                idx2model[modelcounter] = modelID
+                modelcounter += 1
+            if itemID not in item2idx:
+                item2idx[itemID] = itemcounter
+                idx2item[itemcounter] = itemID
+                itemcounter += 1
+            midx = model2idx[modelID]
+            iidx = item2idx[itemID]
+            models.append(midx) 
+            items.append(iidx) 
+            responses.append(response)
+
+    mnist = MNIST(train=True, root=root, download=download)
+    mnist.data = fn_x_mnist(mnist.data.float(), use_cuda)
+
+    xs = mnist.data
+
+    #xs = torch.tensor([mnist.data[i] for i in items])
+
+    return (models, items, responses, xs) 
+
+
+def setup_data_loaders(dataset, use_cuda, batch_size, sup_num=None, root=None, download=True, irt_file=None, **kwargs):
     """
         helper function for setting up pytorch data loaders for a semi-supervised dataset
     :param dataset: the data to use
@@ -220,6 +269,9 @@ def setup_data_loaders(dataset, use_cuda, batch_size, sup_num=None, root=None, d
         cached_data[mode] = dataset(root=root, mode=mode, download=download,
                                     sup_num=sup_num, use_cuda=use_cuda)
         loaders[mode] = DataLoader(cached_data[mode], batch_size=batch_size, shuffle=True, **kwargs)
+
+    if irt_file is not None:
+        loaders['irt'] = load_irt_data(irt_file, root, download, use_cuda)
 
     return loaders
 

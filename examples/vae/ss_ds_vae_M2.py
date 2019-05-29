@@ -2,6 +2,8 @@ import argparse
 
 import torch
 import torch.nn as nn
+import torch.distributions.constraints as constraints
+
 from visdom import Visdom
 
 import pyro
@@ -11,13 +13,13 @@ from pyro.infer import SVI, JitTrace_ELBO, JitTraceEnum_ELBO, Trace_ELBO, TraceE
 from pyro.optim import Adam
 from utils.custom_mlp import MLP, Exp
 from utils.mnist_cached import MNISTCached, mkdir_p, setup_data_loaders
-from utils.vae_plots import mnist_test_tsne_ssvae, plot_conditional_samples_ssvae
+from utils.vae_plots import mnist_test_tsne_ssvae, plot_conditional_samples_ssvae, plot_conditional_samples_ssvae_irt 
 
 
-class SSVAE(nn.Module):
+class SSDSVAE(nn.Module):
     """
     This class encapsulates the parameters (neural networks) and models & guides needed to train a
-    semi-supervised variational auto-encoder on the MNIST image dataset
+    semi-supervised, distant supervised variational auto-encoder on the MNIST image dataset
 
     :param output_size: size of the tensor representing the class label (10 for MNIST since
                         we represent the class labels as a one-hot vector with 10 components)
@@ -33,7 +35,7 @@ class SSVAE(nn.Module):
     def __init__(self, output_size=10, input_size=784, z_dim=50, hidden_layers=(500,),
                  config_enum=None, use_cuda=False, aux_loss_multiplier=None):
 
-        super(SSVAE, self).__init__()
+        super(SSDSVAE, self).__init__()
 
         # initialize the class with all arguments provided to the constructor
         self.output_size = output_size
@@ -57,9 +59,18 @@ class SSVAE(nn.Module):
         # these networks are MLPs (multi-layered perceptrons or simple feed-forward networks)
         # where the provided activation parameter is used on every linear layer except
         # for the output layer where we use the provided output_activation parameter
-        self.encoder_y = MLP([self.input_size] + hidden_sizes + [self.output_size],
+
+        # encoder for irt difficulty will look a lot like encoder_z
+        self.encoder_diff = MLP([self.input_size] +
+                             hidden_sizes + [[1, 1]],
                              activation=nn.Softplus,
-                             output_activation=nn.Softmax,
+                             output_activation=[None, Exp],
+                             allow_broadcast=self.allow_broadcast,
+                             use_cuda=self.use_cuda)
+
+        self.encoder_y = MLP([self.input_size] + hidden_sizes + [[self.output_size, 1, 1]],
+                             activation=nn.Softplus,
+                             output_activation=[nn.Softmax, None, Exp],
                              allow_broadcast=self.allow_broadcast,
                              use_cuda=self.use_cuda)
 
@@ -67,14 +78,14 @@ class SSVAE(nn.Module):
         # and potentially applying separate activation functions on them
         # e.g. in this network the final output is of size [z_dim,z_dim]
         # to produce loc and scale, and apply different activations [None,Exp] on them
-        self.encoder_z = MLP([self.input_size + self.output_size] +
+        self.encoder_z = MLP([self.input_size + self.output_size + 1] +
                              hidden_sizes + [[z_dim, z_dim]],
                              activation=nn.Softplus,
                              output_activation=[None, Exp],
                              allow_broadcast=self.allow_broadcast,
                              use_cuda=self.use_cuda)
 
-        self.decoder = MLP([z_dim + self.output_size] +
+        self.decoder = MLP([z_dim + self.output_size + 1] +
                            hidden_sizes + [self.input_size],
                            activation=nn.Softplus,
                            output_activation=nn.Sigmoid,
@@ -85,12 +96,13 @@ class SSVAE(nn.Module):
         if self.use_cuda:
             self.cuda()
 
-    def model(self, xs, ys=None):
+    def model(self, xs, ys=None, ds=None):
         """
         The model corresponds to the following generative process:
         p(z) = normal(0,I)              # handwriting style (latent)
         p(y|x) = categorical(I/10.)     # which digit (semi-supervised)
-        p(x|y,z) = bernoulli(loc(y,z))   # an image
+        p(b) = normal(0,1)              # item difficulty
+        p(x|y,z,diff) = bernoulli(loc(y,z,diff))   # an image
         loc is given by a neural network  `decoder`
 
         :param xs: a batch of scaled vectors of pixels from an image
@@ -103,23 +115,30 @@ class SSVAE(nn.Module):
 
         batch_size = xs.size(0)
         options = dict(dtype=xs.dtype, device=xs.device)
-        with pyro.plate("data"):
+        with pyro.plate("data", batch_size):
 
             # sample the handwriting style from the constant prior distribution
             prior_loc = torch.zeros(batch_size, self.z_dim, **options)
             prior_scale = torch.ones(batch_size, self.z_dim, **options)
             zs = pyro.sample("z", dist.Normal(prior_loc, prior_scale).to_event(1))
 
-            # if the label y (which digit to write) is supervised, sample from the
+            # if the label y (which digit to write) is unsupervised, sample from the
             # constant prior, otherwise, observe the value (i.e. score it against the constant prior)
             alpha_prior = torch.ones(batch_size, self.output_size, **options) / (1.0 * self.output_size)
             ys = pyro.sample("y", dist.OneHotCategorical(alpha_prior), obs=ys)
+
+            # sample the item difficulty from the prior distribution
+            # if the difficulty is supervised, observe it 
+            diff_prior_loc = torch.zeros(batch_size, 1, **options) 
+            diff_prior_scale = torch.ones(batch_size, 1, **options).fill_(1.e3)
+            diffs = pyro.sample('diff', dist.Normal(diff_prior_loc, diff_prior_scale).to_event(1), obs=ds)  
 
             # finally, score the image (x) using the handwriting style (z) and
             # the class label y (which digit to write) against the
             # parametrized distribution p(x|y,z) = bernoulli(decoder(y,z))
             # where `decoder` is a neural network
-            loc = self.decoder.forward([zs, ys])
+            #loc = self.decoder.forward([zs, ys, diffs])
+            loc = self.decoder.forward([zs, ys, diffs])
             pyro.sample("x", dist.Bernoulli(loc).to_event(1), obs=xs)
             # return the loc so we can visualize it later
             return loc
@@ -138,22 +157,118 @@ class SSVAE(nn.Module):
         :return: None
         """
         # inform Pyro that the variables in the batch of xs, ys are conditionally independent
-        with pyro.plate("data"):
+        batch_size = xs.size(0)
+        # sample difficulties first
+        #print(xs.size(), loc_diff.size())  
+        #diffs = pyro.sample('diff', dist.Normal(loc_diff, scale_diff)) 
+
+        with pyro.plate("data", batch_size):
 
             # if the class label (the digit) is not supervised, sample
             # (and score) the digit with the variational distribution
             # q(y|x) = categorical(alpha(x))
+            #loc_diff, scale_diff = self.encoder_diff.forward(xs)
+            #print(loc_diff.size())
+            #diffs = pyro.sample('diff', dist.Normal(loc_diff.unsqueeze(0), scale_diff.unsqueeze(0)))
             if ys is None:
-                alpha = self.encoder_y.forward(xs)
+                #print(diffs.size())
+                alpha, loc_diff, scale_diff = self.encoder_y.forward(xs)
                 #print(alpha.size())
                 ys = pyro.sample("y", dist.OneHotCategorical(alpha))
-                #print(ys.size())
+                #print(ys.size()) 
+            else:
+                _, loc_diff, scale_diff = self.encoder_y.forward(xs) 
 
+            diffs = pyro.sample('diff', dist.Normal(loc_diff, scale_diff).to_event(1))
+            #print(diffs.size())
+                
             # sample (and score) the latent handwriting-style with the variational
             # distribution q(z|x,y) = normal(loc(x,y),scale(x,y))
-            loc, scale = self.encoder_z.forward([xs, ys])
+            #loc, scale = self.encoder_z.forward([xs, ys, diffs])
+            loc, scale = self.encoder_z.forward([xs, ys, diffs])
             #print(loc.size()) 
             pyro.sample("z", dist.Normal(loc, scale).to_event(1))
+
+
+    def model_irt(self, models, items, obs, xs):
+        '''
+        p(theta) = normal(0,1)          # model ability (distant supervision)
+        p(c | b, theta) = link(theta - b)  # probability of correct 
+        '''
+        # register all pytorch (sub)modules with pyro
+        pyro.module("ss_vae", self)
+        num_models = len(set(models))
+        num_items = len(set(items))
+        #print('model', num_models, num_items) 
+        options = dict(dtype=xs.dtype, device=xs.device)
+        batch_size = xs.size(0)
+
+        # vectorize
+        models = torch.tensor(models, dtype=torch.long, device=xs.device)
+        items = torch.tensor(items, dtype=torch.long, device=xs.device)
+        obs = torch.tensor(obs, dtype=torch.float, device=xs.device)
+
+        with pyro.plate("thetas"):
+            ability = pyro.sample('theta', dist.Normal(torch.zeros(num_models, **options),
+                torch.ones(num_models, **options)))
+        with pyro.plate("diffs"):
+            diff = pyro.sample('b', dist.Normal(torch.zeros(num_items, **options),
+                torch.tensor(num_items, **options).fill_(1.e3)))
+
+        with pyro.plate("data"):
+            # for now, I need to make the (too-naive) assumption that everything is independent
+            pyro.sample("obs", dist.Bernoulli(logits=ability[models] - diff[items]), obs=obs)
+            #print('model', diff.size())
+            #pyro.sample("obs", dist.Bernoulli(logits=ability - diff), obs=obs)
+        
+    def guide_irt(self, models, items, obs, xs):
+        '''
+        IRT guide:
+
+        ''' 
+        num_models = len(set(models))
+        num_items = len(set(items))
+        #print('guide', num_models, num_items) 
+        options = dict(dtype=xs.dtype, device=xs.device)
+        batch_size = xs.size(0)
+
+        # vectorize
+        models = torch.tensor(models, dtype=torch.long, device=xs.device)
+        items = torch.tensor(items, dtype=torch.long, device=xs.device)
+        obs = torch.tensor(obs, dtype=torch.float, device=xs.device)
+
+
+        # register learnable params in the param store
+        with pyro.plate("thetas"):
+            m_theta_param = pyro.param("loc_ability", torch.zeros(num_models, **options))
+            s_theta_param = pyro.param("scale_ability", torch.ones(num_models, **options),
+                            constraint=constraints.positive)
+            dist_theta = dist.Normal(m_theta_param, s_theta_param)
+            pyro.sample("theta", dist_theta)
+
+        # items 
+        with pyro.plate("diffs"):
+            irt_batch_size = 256
+            loc_diffs_all, scale_diffs_all = [], []
+            for i in range(0, len(xs), irt_batch_size):
+                if len(xs[i:]) < irt_batch_size:
+                    batch_xs = xs[i:]
+                    _, loc_diffs, scale_diffs = self.encoder_y.forward(batch_xs)            
+                    loc_diffs_all.extend(loc_diffs)
+                    scale_diffs_all.extend(scale_diffs) 
+                else:
+                    # pick out the appropriate images from xs based on items idx
+                    batch_xs = xs[i:i+irt_batch_size]
+                    _, loc_diffs, scale_diffs = self.encoder_y.forward(batch_xs)            
+                    loc_diffs_all.extend(loc_diffs)
+                    scale_diffs_all.extend(scale_diffs)
+            #_, loc_diffs, scale_diffs = self.encoder_y.forward(xs) 
+            loc_diffs_all = torch.tensor(loc_diffs_all, **options) 
+            scale_diffs_all = torch.tensor(scale_diffs_all, **options)            
+            dist_b = dist.Normal(loc_diffs_all, scale_diffs_all)
+            #print(dist_b.size())
+            pyro.sample('b', dist_b)
+
 
     def classifier(self, xs):
         """
@@ -162,10 +277,11 @@ class SSVAE(nn.Module):
         :param xs: a batch of scaled vectors of pixels from an image
         :return: a batch of the corresponding class labels (as one-hots)
         """
+        #diff, _ = self.encoder_diff.forward(xs)
         # use the trained model q(y|x) = categorical(alpha(x))
         # compute all class probabilities for the image(s)
-        alpha = self.encoder_y.forward(xs)
-
+        #alpha = self.encoder_y.forward([xs, diff])
+        alpha, loc_d, scale_d = self.encoder_y.forward(xs)
         # get the index (digit) that corresponds to
         # the maximum predicted class probability
         res, ind = torch.topk(alpha, 1)
@@ -186,7 +302,9 @@ class SSVAE(nn.Module):
         with pyro.plate("data"):
             # this here is the extra term to yield an auxiliary loss that we do gradient descent on
             if ys is not None:
-                alpha = self.encoder_y.forward(xs)
+                #diff, _ = self.encoder_diff.forward(xs)
+                #alpha = self.encoder_y.forward([xs, diff])
+                alpha, loc_d, scale_d = self.encoder_y.forward(xs)
                 with pyro.poutine.scale(scale=self.aux_loss_multiplier):
                     pyro.sample("y_aux", dist.OneHotCategorical(alpha), obs=ys)
 
@@ -203,19 +321,47 @@ def run_inference_for_epoch(data_loaders, losses, periodic_interval_batches):
     returns the values of all losses separately on supervised and unsupervised parts
     """
     num_losses = len(losses)
+    print(num_losses)
 
     # compute number of batches for an epoch
     sup_batches = len(data_loaders["sup"])
     unsup_batches = len(data_loaders["unsup"])
+    irt_batches = len(data_loaders['irt'])  # should only count as 1 
     batches_per_epoch = sup_batches + unsup_batches
 
     # initialize variables to store loss values
     epoch_losses_sup = [0.] * num_losses
     epoch_losses_unsup = [0.] * num_losses
+    epoch_losses_irt = 0. 
 
     # setup the iterators for training data loaders
     sup_iter = iter(data_loaders["sup"])
     unsup_iter = iter(data_loaders["unsup"])
+
+    # RUN IRT batch here (outside of other logic)
+    models, items, obs, xs = data_loaders['irt'] 
+    #models = models[0:100]
+    #items = items[0:100]
+    #obs = obs[0:100] 
+    #xs = xs[0:1000]
+
+
+    irt_batch_size = 256
+    epoch_losses_irt = losses[-1].step(models, items, obs, xs) 
+    '''
+    for i in range(0, len(obs), irt_batch_size):
+        if len(models[i:]) < irt_batch_size:
+            pass
+            #batch_xs = xs[items[i:]]
+            #epoch_losses_irt += losses[-1].step(models[i:], items[i:], obs[i:], batch_xs) 
+        else:
+            # pick out the appropriate images from xs based on items idx
+            batch_xs = xs[items[i:i+irt_batch_size]]
+            epoch_losses_irt += losses[-1].step(models[i:i+irt_batch_size], 
+                    items[i:i+irt_batch_size], 
+                    obs[i:i+irt_batch_size], 
+                    batch_xs)
+    '''
 
     # count the number of supervised batches seen in this epoch
     ctr_sup = 0
@@ -233,7 +379,7 @@ def run_inference_for_epoch(data_loaders, losses, periodic_interval_batches):
 
         # run the inference for each loss with supervised or un-supervised
         # data as arguments
-        for loss_id in range(num_losses):
+        for loss_id in range(num_losses - 1):  # irt is last 1
             if is_supervised:
                 new_loss = losses[loss_id].step(xs, ys)
                 epoch_losses_sup[loss_id] += new_loss
@@ -242,7 +388,7 @@ def run_inference_for_epoch(data_loaders, losses, periodic_interval_batches):
                 epoch_losses_unsup[loss_id] += new_loss
 
     # return the values of all losses
-    return epoch_losses_sup, epoch_losses_unsup
+    return epoch_losses_sup, epoch_losses_unsup, epoch_losses_irt 
 
 
 def get_accuracy(data_loader, classifier_fn, batch_size):
@@ -271,7 +417,9 @@ def get_accuracy(data_loader, classifier_fn, batch_size):
 
 def visualize(ss_vae, viz, test_loader):
     if viz:
-        plot_conditional_samples_ssvae(ss_vae, viz)
+        # for a few difficulties, plot everything
+        for diff in [-3., -2., -1., 0., 1., 2., 3.]:
+            plot_conditional_samples_ssvae_irt(ss_vae, viz, diff)
         mnist_test_tsne_ssvae(ssvae=ss_vae, test_loader=test_loader)
 
 
@@ -286,11 +434,12 @@ def main(args):
 
     viz = None
     if args.visualize:
-        viz = Visdom()
+        #viz = Visdom()
+        viz=True 
         mkdir_p("./vae_results")
 
     # batch_size: number of images (and labels) to be considered in a batch
-    ss_vae = SSVAE(z_dim=args.z_dim,
+    ss_vae = SSDSVAE(z_dim=args.z_dim,
                    hidden_layers=args.hidden_layers,
                    use_cuda=args.cuda,
                    config_enum=args.enum_discrete,
@@ -314,12 +463,17 @@ def main(args):
         elbo = JitTrace_ELBO() if args.jit else Trace_ELBO()
         loss_aux = SVI(ss_vae.model_classify, ss_vae.guide_classify, optimizer, loss=elbo)
         losses.append(loss_aux)
+    
+    # add irt loss 
+    elbo = JitTrace_ELBO() if args.jit else Trace_ELBO()
+    loss_irt = SVI(ss_vae.model_irt, ss_vae.guide_irt, optimizer, loss=elbo) 
+    losses.append(loss_irt) 
 
     try:
         # setup the logger if a filename is provided
         logger = open(args.logfile, "w") if args.logfile else None
 
-        data_loaders = setup_data_loaders(MNISTCached, args.cuda, args.batch_size, sup_num=args.sup_num)
+        data_loaders = setup_data_loaders(MNISTCached, args.cuda, args.batch_size, sup_num=args.sup_num, irt_file=args.irt_file)
 
         # how often would a supervised batch be encountered during inference
         # e.g. if sup_num is 3000, we would have every 16th = int(50000/3000) batch supervised
@@ -338,7 +492,7 @@ def main(args):
         for i in range(0, args.num_epochs):
 
             # get the losses for an epoch
-            epoch_losses_sup, epoch_losses_unsup = \
+            epoch_losses_sup, epoch_losses_unsup, epoch_losses_irt = \
                 run_inference_for_epoch(data_loaders, losses, periodic_interval_batches)
 
             # compute average epoch losses i.e. losses per example
@@ -350,6 +504,7 @@ def main(args):
             str_loss_unsup = " ".join(map(str, avg_epoch_losses_unsup))
 
             str_print = "{} epoch: avg losses {}".format(i, "{} {}".format(str_loss_sup, str_loss_unsup))
+            str_print += " irt loss: {}".format(epoch_losses_irt)
 
             validation_accuracy = get_accuracy(data_loaders["valid"], ss_vae.classifier, args.batch_size)
             str_print += " validation accuracy {}".format(validation_accuracy)
@@ -371,8 +526,14 @@ def main(args):
         print_and_log(logger, "best validation accuracy {} corresponding testing accuracy {} "
                       "last testing accuracy {}".format(best_valid_acc, corresponding_test_acc, final_test_accuracy))
 
+        # save the model
+        outfile = args.outfile 
+        print_and_log(logger, 'saving model parameters to {}'.format(outfile)) 
+        pyro.get_param_store().save(outfile) 
+        
         # visualize the conditional samples
         visualize(ss_vae, viz, data_loaders["test"])
+
     finally:
         # close the logger file object if we opened it earlier
         if args.logfile:
@@ -421,6 +582,8 @@ if __name__ == "__main__":
                         help="seed for controlling randomness in this example")
     parser.add_argument('--visualize', action="store_true",
                         help="use a visdom server to visualize the embeddings")
+    parser.add_argument('--irt-file') 
+    parser.add_argument('--outfile', help='where should we save the model after training?')
     args = parser.parse_args()
 
     # some assertions to make sure that batching math assumptions are met
